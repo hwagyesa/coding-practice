@@ -2,5 +2,12 @@ training:
   device: 'cuda'
   lr_initial: 0.01
   weight_decay: 0
+  warmup_epochs: 16
   epochs: 256
   batch_size: 1024
+model:
+  embedding_dim: 384
+  num_classes: 10
+  num_heads: 6
+  num_layers: 12
+  patch_size: 16
