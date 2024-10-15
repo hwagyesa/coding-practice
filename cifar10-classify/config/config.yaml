@@ -1,7 +1,7 @@
 training:
   device: 'cuda'
   lr_initial: 0.01
-  weight_decay: 0
+  weight_decay: 0.05
   warmup_epochs: 16
   epochs: 128
   batch_size: 512
