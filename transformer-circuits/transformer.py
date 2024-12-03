@@ -6,6 +6,7 @@ import dataclasses
 import math
 import operator
 import pickle
+import random
 import re
 import time
 import unicodedata
@@ -115,6 +116,7 @@ class MHSA(nn.Module):
             return self._forward_einsum(x)
 
     def _forward_einsum(self, x):
+        device = x.device
         # x is: b x L x d
         q, k, v = self.qkv(x).split(self.d, dim=-1)  # b x L x 3d
         Q = q.view(q.shape[:-1] + (self.h, self.d // self.h))
@@ -122,7 +124,10 @@ class MHSA(nn.Module):
         V = v.view(v.shape[:-1] + (self.h, self.d // self.h))  # b x L x h x (d/h)
         scores = torch.einsum("blhd,bmhd->bhlm", Q, K) / math.sqrt(self.d / self.h)
         L = x.shape[-2]
-        mask = torch.arange(L)[:, None] < torch.arange(L)[None, :]
+        mask = (
+            torch.arange(L, device=device)[:, None]
+            < torch.arange(L, device=device)[None, :]
+        )
         scores += torch.where(mask, -torch.inf, 0)  # to zero out, put -inf!
         attention = nn.functional.softmax(scores, dim=-1)
         # attention = nn.functional.softmax(scores, dim=-1)
@@ -133,6 +138,7 @@ class MHSA(nn.Module):
 
     def _forward_matmul(self, x):
         # x is: b x L x d
+        device = x.device
         q, k, v = self.qkv(x).split(self.d, dim=-1)  # b x L x 3d
         Q = q.view(q.shape[:-1] + (self.h, self.d // self.h)).transpose(-3, -2)
         K = k.view(k.shape[:-1] + (self.h, self.d // self.h)).transpose(-3, -2)
@@ -141,7 +147,10 @@ class MHSA(nn.Module):
         )  # b x L x h x (d/h)
         scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d / self.h)
         L = x.shape[-2]
-        mask = torch.arange(L)[:, None] < torch.arange(L)[None, :]
+        mask = (
+            torch.arange(L, device=device)[:, None]
+            < torch.arange(L, device=device)[None, :]
+        )
         scores += torch.where(mask, -torch.inf, 0)  # to zero out, put -inf!
         attention = nn.functional.softmax(scores, dim=-1)
         self_attention = attention @ V  # b x h x L x (d/h)
@@ -150,6 +159,7 @@ class MHSA(nn.Module):
         return out
 
     def _forward_coord(self, x):
+        device = x.device
         # Explicitly extract the QKV matrices.
         # Our code above is reshaping to ..., h x 3 x (d/h)
         # So the relevant parts of the qkv projections are a little delocalized
@@ -167,7 +177,10 @@ class MHSA(nn.Module):
         )  # output is b x h x L x d/h
         scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d / self.h)
         L = x.shape[-2]
-        mask = torch.arange(L)[:, None] < torch.arange(L)[None, :]
+        mask = (
+            torch.arange(L, device=device)[:, None]
+            < torch.arange(L, device=device)[None, :]
+        )
         scores += torch.where(mask, -torch.inf, 0)  # to zero out, put -inf!
         attention = nn.functional.softmax(scores, dim=-1)
         self_attention = attention @ V  # b x h x L x d/h
@@ -180,6 +193,7 @@ class MHSA(nn.Module):
         return out
 
     def _forward_qk_vo(self, x):
+        device = x.device
         # Explicitly extract the QKV matrices.
         # Also employ the QK and VO parameterization. (compose matmuls)
         qkv_weight = self.qkv.weight  # 3d x d
@@ -200,7 +214,10 @@ class MHSA(nn.Module):
             x[:, None, ...] @ qk_proj @ x[:, None, ...].transpose(-2, -1)
         ) / math.sqrt(self.d / self.h)  # b x h x L x L
         L = x.shape[-2]
-        mask = torch.arange(L)[:, None] < torch.arange(L)[None, :]
+        mask = (
+            torch.arange(L, device=device)[:, None]
+            < torch.arange(L, device=device)[None, :]
+        )
         head_scores += torch.where(mask, -torch.inf, 0)  # to zero out, put -inf!
         attention = nn.functional.softmax(head_scores, dim=-1)
         self_attention = attention @ x[:, None, ...]  # b x h x L x d
@@ -312,7 +329,10 @@ class TransformerAttnOnly(nn.Module):
         # Blocks: layers
         transformer_blocks = []
         for layer in range(layers):
-            transformer_blocks.append(MHSA(d=d, h=h, L=context_length))
+            attn = MHSA(d=d, h=h, L=context_length)
+            transformer_blocks.append(attn)
+            # Register parameters for non-Sequential construction
+            self.add_module(f"MHSA {layer}", attn)
         # self.transformer = nn.Sequential(*transformer_blocks)
         self.transformer_blocks = transformer_blocks
         # Output stage
@@ -427,7 +447,7 @@ if __name__ == "__main__":
     num_vocab_base = 128
     num_vocab_special = 1  # pad token
     num_vocab = num_vocab_base + num_vocab_special
-    context_length = 512
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # # Process data from scratch + dump tokens
     # tokens_list = prepare_tinystories_block(
@@ -463,20 +483,25 @@ if __name__ == "__main__":
     with open("bigrams.pkl", "rb") as f:
         bigram_freqs = pickle.load(f)
 
+    context_length = 256
+    load_model = False
+    save_path = "model_1layer_attnonly.pth"
+    load_path = "model_1layer_attnonly.pth"
     model_params = {
         "k": num_vocab,
-        "d": 32,
-        "h": 4,
+        "d": 384,
+        "h": 6,
         "layers": 1,
         "context_length": context_length,
     }
     model = TransformerAttnOnly(**model_params)
+    model.to(device)
 
     # Hyperparameters
-    batches = 1024
-    batch_size = 128
-    lr = 5e-4
-    wd = 1e-6
+    batches = 4 * 1024
+    batch_size = 64
+    lr = 1e-3
+    wd = 1e-1
 
     # Prepare data
     # ?: How do we load data for a next-token-prediction training...?
@@ -490,10 +515,6 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=lr, weight_decay=wd)
     ce_loss = torch.nn.CrossEntropyLoss()
 
-    load_model = False
-    save_path = "model_1layer_attnonly.pth"
-    load_path = "model_bigram.pth"
-
     if not load_model:
         # Train
         model.train()
@@ -505,6 +526,7 @@ if __name__ == "__main__":
             y_batch = torch.stack(
                 [tokens[i + 1 : i + 1 + context_length] for i in idxs]
             )
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
 
             logits = model(x_batch.to(torch.int32))
             loss = ce_loss(logits.transpose(-2, -1), y_batch.to(torch.int64))
@@ -512,6 +534,8 @@ if __name__ == "__main__":
             # So these loss values are 'optimally' of size about log(batch_size) / context_length
 
             loss.backward()
+            # TODO: unstable training even with grad clipping sometimes at 6layer model. Find out why
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
             pbar.set_postfix({"batch loss": f"{loss.detach():.3f}"})
@@ -532,7 +556,10 @@ if __name__ == "__main__":
             f"empirical conditional entropy: {-p @ torch.log(p + 1e-8) + q @ torch.log(q + 1e-8)}"
         )
         # Save model
-        model_info = {"state_dict": model.state_dict(), "params": model_params}
+        model_info = {
+            "state_dict": model.to("cpu").state_dict(),
+            "params": model_params,
+        }
         torch.save(model_info, save_path)
 
     else:
@@ -542,22 +569,25 @@ if __name__ == "__main__":
         model.load_state_dict(model_info["state_dict"])
 
     # Sample
+    model.to(device)
     model.eval()
     # Get some prompts
-    docs, _, __ = prepare_tinystories(max_context_length=context_length // 2)
-    prompt = docs[0]
+    docs, _, __ = prepare_tinystories(max_context_length=512)
+    i = random.randint(0, len(docs) - 1)
+    prompt = docs[i][: context_length // 2]
     print("The prompt: " + prompt)
     # inference: temperature-based
     temperature = 0.5
     # TODO: KV-caching
     # TODO: batch inference
+    # TODO: More fun sampling strategies
     num_toks = context_length // 2
     tokenizer = ASCIITokenizerSpecial()
-    tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32)
+    tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32).to(device)
     with torch.no_grad():
         gen = ""
         for gens in tqdm(range(num_toks)):
-            logits = model(tokens)[-1, ...]
+            logits = model(tokens.unsqueeze(0))[0, -1, ...]
             next_token = sample(temperature, logits)
             tokens = torch.cat((tokens, next_token))
             gen += tokenizer.decode([int(next_token)])
