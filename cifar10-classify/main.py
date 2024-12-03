@@ -30,7 +30,7 @@ class MultiHeadSelfAttention(nn.Module):
 
     def forward(self, input, debug=False):
         x = self.norm(input)  # x is b x n x d
-        qkv = self.qkv(x)  # this is b x n x 3d
+        x = self.qkv(x)  # this is b x n x 3d
         # if debug:
         #     q = self.qkv.weight[0 : self.input_dim, :]
         #     k = self.qkv.weight[self.input_dim : 2 * self.input_dim, :]
@@ -41,12 +41,12 @@ class MultiHeadSelfAttention(nn.Module):
         #     )
         #     assert torch.all(qkv[0, :, 2 * self.input_dim :].T == v @ x[0, ...].T)
         # Head reshaping. This is now b x h x 3 x n x d/h
-        qkv_heads = rearrange(qkv, "b n (c h d) -> b h c n d", c=3, h=self.num_heads)
+        x = rearrange(x, "b n (c h d) -> b h c n d", c=3, h=self.num_heads)
         attn = self.softmax(
             self.scale
             * einsum(
-                qkv_heads[:, :, 0, ...],
-                qkv_heads[:, :, 1, ...],
+                x[:, :, 0, ...],
+                x[:, :, 1, ...],
                 "b h n1 d, b h n2 d -> b h n1 n2",
             )
         )
@@ -58,16 +58,16 @@ class MultiHeadSelfAttention(nn.Module):
         #     qk_h0 = q_proj_h0 @ k_proj_h0.T
         #     softmax_h0 = torch.nn.functional.softmax(qk_h0, dim=-1)
         #     assert torch.all(softmax_h0 == attn[0, 0, ...])
-        self_attn = einsum(
-            qkv_heads[:, :, 2, ...], attn, "b h n2 d, b h n1 n2 -> b h n1 d"
+        x = einsum(
+            x[:, :, 2, ...], attn, "b h n2 d, b h n1 n2 -> b h n1 d"
         )
         # if debug:
         #     v_proj = (v @ x[0, ...].T).T
         #     v_proj_h0 = v_proj[:, : self.input_dim // self.num_heads]
         #     self_attn_h0 = (v_proj_h0.T @ softmax_h0.T).T
         #     assert torch.all(self_attn_h0 == self_attn[0, 0, ...])
-        projected = self.projection(rearrange(self_attn, "b h n d -> b n (h d)"))
-        return projected
+        x = self.projection(rearrange(x, "b h n d -> b n (h d)"))
+        return x
 
 
 class FeedForward(nn.Module):
@@ -220,7 +220,7 @@ def train(cfg: DictConfig):
         train_data,
         batch_size=cfg.training.batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=16,
         pin_memory=True,
     )
     val_loader = DataLoader(
@@ -267,6 +267,7 @@ def train(cfg: DictConfig):
     # TODO: Benchmarking for performance? torch.utils.benchmark
 
     # loss, optim, train loop
+    scaler = torch.cuda.amp.GradScaler()
     loss_fn = nn.CrossEntropyLoss(reduction="mean")
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -288,7 +289,7 @@ def train(cfg: DictConfig):
     # )
     # Customized cosine scheduler with warmup.
     # From the CRATE repo.
-    lr_func = lambda epoch: min(
+    lr_func = lambda epoch: 0.1 * min(
         (epoch + 1) / (cfg.training.warmup_epochs + 1e-8),
         0.5 * (math.cos(epoch / cfg.training.epochs * math.pi) + 1),
     )
@@ -303,7 +304,9 @@ def train(cfg: DictConfig):
             # do work
             X = X.to(device, non_blocking=True)
             Y = Y.to(device, non_blocking=True)
-            loss, acc = process_batch(X, Y, loss_fn, model, optimizer, training=True)
+            loss, acc = process_batch(
+                X, Y, loss_fn, model, optimizer, scaler, training=True
+            )
             wandb.log(
                 {"batch": batch, "batch_loss_train": loss, "batch_acc_train": acc}
             )
@@ -316,7 +319,7 @@ def train(cfg: DictConfig):
                 X = X.to(device, non_blocking=True)
                 Y = Y.to(device, non_blocking=True)
                 loss, acc = process_batch(
-                    X, Y, loss_fn, model, optimizer, training=False
+                    X, Y, loss_fn, model, optimizer, scaler, training=False
                 )
                 wandb.log(
                     {"epoch": epoch, "epoch_loss_val": loss, "epoch_acc_val": acc}
@@ -327,17 +330,21 @@ def train(cfg: DictConfig):
 
 
 def process_batch(
-    X, Y, loss_fn, model, optimizer: torch.optim.Optimizer, training=True
+    X, Y, loss_fn, model, optimizer: torch.optim.Optimizer, scaler, training=True
 ):
-    logits = model(X)
-    preds = torch.argmax(logits, dim=-1)
-    loss = loss_fn(logits, Y)
-    acc = torch.sum(preds == Y) / Y.shape[0]
+    optimizer.zero_grad()
+    with torch.cuda.amp.autocast():
+        logits = model(X)
+        loss = loss_fn(logits, Y)
+
+    with torch.no_grad():
+        preds = torch.argmax(logits, dim=-1)
+        acc = torch.sum(preds == Y) / Y.shape[0]
 
     if training:
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
     return loss, acc
 
 
