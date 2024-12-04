@@ -390,10 +390,12 @@ def test_qkov():
     L = 2
     k = 16
     atol = 1e-5
-    model = MHSA(d, h, L)
-    qk, ov = model.get_qk_ov()
+    # model = MHSA(d, h, L)
+    # qk, ov = model.get_qk_ov()
     model = TransformerAttnOnly(k, d, h, 1, L)
     qkov_ckt, direct = model.get_qk_ov_circuits()
+    plt.imshow(direct.detach())
+    plt.show()
     print("a")
 
 
