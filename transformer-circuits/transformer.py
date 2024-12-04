@@ -392,10 +392,31 @@ def test_qkov():
     atol = 1e-5
     # model = MHSA(d, h, L)
     # qk, ov = model.get_qk_ov()
-    model = TransformerAttnOnly(k, d, h, 1, L)
+    # model = TransformerAttnOnly(k, d, h, 1, L)
+
+    load_path = "model_1layer_attnonly.pth"
+    # Load from file
+    model_info = torch.load(load_path)
+    model = TransformerAttnOnly(**model_info["params"])
+    model.load_state_dict(model_info["state_dict"])
+
+    model.to('cuda')
     qkov_ckt, direct = model.get_qk_ov_circuits()
-    plt.imshow(direct.detach())
+    model.to('cpu')
+    plt.imshow(direct.detach().cpu())
+    plt.title('direct path matrix')
     plt.show()
+    for qk_h, ov_h in qkov_ckt:
+        for h, qk in enumerate(qk_h.unbind(0)):
+            plt.imshow(qk.detach().cpu())
+            plt.title(f'qk circuit, head {h}')
+            plt.show()
+        for h, ov in enumerate(ov_h.unbind(0)):
+            plt.imshow(ov.detach().cpu())
+            plt.title(f'ov circuit, head {h}')
+            plt.show()
+
+
     print("a")
 
 
@@ -523,14 +544,14 @@ if __name__ == "__main__":
         bigram_freqs = pickle.load(f)
 
     context_length = 256
-    load_model = True
+    load_model = False
     save_path = "model_1layer_attnonly.pth"
     load_path = "model_6layer_attnonly.pth"
     model_params = {
         "k": num_vocab,
         "d": 384,
         "h": 6,
-        "layers": 6,
+        "layers": 1,
         "context_length": context_length,
     }
     model = TransformerAttnOnly(**model_params)
