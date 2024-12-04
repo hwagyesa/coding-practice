@@ -13,6 +13,7 @@ import unicodedata
 from functools import reduce
 from pathlib import Path
 from statistics import mean, stdev
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn.functional as F
@@ -164,7 +165,6 @@ class MHSA(nn.Module):
         # Our code above is reshaping to ..., h x 3 x (d/h)
         # So the relevant parts of the qkv projections are a little delocalized
         qkv_weight = self.qkv.weight  # 3d x d
-        # TODO: this view + unbind can be combined into 1 split call
         qkv_weight_split = qkv_weight.view(
             3, self.h, self.d // self.h, self.d
         )  # 3 x h x d/h x d
@@ -197,7 +197,6 @@ class MHSA(nn.Module):
         # Explicitly extract the QKV matrices.
         # Also employ the QK and VO parameterization. (compose matmuls)
         qkv_weight = self.qkv.weight  # 3d x d
-        # TODO: this view + unbind can be combined into 1 split call
         qkv_weight_split = qkv_weight.view(
             3, self.h, self.d // self.h, self.d
         )  # 3 x h x d/h x d
@@ -225,6 +224,21 @@ class MHSA(nn.Module):
         out_heads = self_attention @ ov_proj.transpose(-2, -1)  # b x h x L x d
         out = out_heads.sum(dim=1)  # b x L x d
         return out
+
+    def get_qk_ov(self):
+        qkv_weight = self.qkv.weight  # 3d x d
+        qkv_weight_split = qkv_weight.view(
+            3, self.h, self.d // self.h, self.d
+        )  # 3 x h x d/h x d
+        q_proj, k_proj, v_proj = qkv_weight_split.unbind(0)  # each is h x d/h x d
+        qk_proj = q_proj.transpose(-1, -2) @ k_proj  # h x d x d
+        proj_weight = self.projection.weight  # d x d
+        # Extract column submatrices
+        proj_weight_split = proj_weight.T.view(
+            self.h, self.d // self.h, self.d
+        )  # h x d/h x d
+        ov_proj = proj_weight_split.transpose(-1, -2) @ v_proj  # h x d x d
+        return qk_proj, ov_proj
 
 
 def test_mhsa():
@@ -327,7 +341,7 @@ class TransformerAttnOnly(nn.Module):
             torch.randn((context_length, d)), requires_grad=True
         )
         # Blocks: layers
-        transformer_blocks = []
+        transformer_blocks: list[MHSA] = []
         for layer in range(layers):
             attn = MHSA(d=d, h=h, L=context_length)
             transformer_blocks.append(attn)
@@ -358,6 +372,29 @@ class TransformerAttnOnly(nn.Module):
         # logits = x @ self.unembedding  # b x L x k
         logits = self.unembedding(x)
         return logits
+
+    def get_qk_ov_circuits(self):
+        E = self.embedding.weight.T  # d x k
+        U = self.unembedding.weight  # k x d
+        qkov_ckt = []
+        for block in self.transformer_blocks:
+            qk, ov = block.get_qk_ov()  # each is d x d
+            qkov_ckt.append((E.T @ qk @ E, U @ ov @ E))
+        direct = U @ E
+        return qkov_ckt, direct
+
+
+def test_qkov():
+    h = 4
+    d = 8
+    L = 2
+    k = 16
+    atol = 1e-5
+    model = MHSA(d, h, L)
+    qk, ov = model.get_qk_ov()
+    model = TransformerAttnOnly(k, d, h, 1, L)
+    qkov_ckt, direct = model.get_qk_ov_circuits()
+    print("a")
 
 
 @given(st.lists(st.text(alphabet=st.characters(min_codepoint=32, max_codepoint=126))))
@@ -484,14 +521,14 @@ if __name__ == "__main__":
         bigram_freqs = pickle.load(f)
 
     context_length = 256
-    load_model = False
+    load_model = True
     save_path = "model_1layer_attnonly.pth"
-    load_path = "model_1layer_attnonly.pth"
+    load_path = "model_6layer_attnonly.pth"
     model_params = {
         "k": num_vocab,
         "d": 384,
         "h": 6,
-        "layers": 1,
+        "layers": 6,
         "context_length": context_length,
     }
     model = TransformerAttnOnly(**model_params)
