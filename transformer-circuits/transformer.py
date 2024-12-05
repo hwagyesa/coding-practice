@@ -13,8 +13,8 @@ import unicodedata
 from functools import reduce
 from pathlib import Path
 from statistics import mean, stdev
-import matplotlib.pyplot as plt
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from hypothesis import given
@@ -106,7 +106,7 @@ class MHSA(nn.Module):
         self.projection = nn.Linear(d, d, bias=False)
         nn.init.kaiming_normal_(self.projection.weight, nonlinearity="linear")
 
-    def forward(self, x, mode=-1):
+    def forward(self, x, mode=-1, tied=False):
         if mode == 0:
             return self._forward_matmul(x)
         elif mode == 1:
@@ -114,12 +114,14 @@ class MHSA(nn.Module):
         elif mode == 2:
             return self._forward_qk_vo(x)
         else:
-            return self._forward_einsum(x)
+            return self._forward_einsum(x, tied=tied)
 
-    def _forward_einsum(self, x):
+    def _forward_einsum(self, x, tied=False):
         device = x.device
         # x is: b x L x d
         q, k, v = self.qkv(x).split(self.d, dim=-1)  # b x L x 3d
+        if tied:
+            q, k, v = q, q, q
         Q = q.view(q.shape[:-1] + (self.h, self.d // self.h))
         K = k.view(k.shape[:-1] + (self.h, self.d // self.h))
         V = v.view(v.shape[:-1] + (self.h, self.d // self.h))  # b x L x h x (d/h)
@@ -332,8 +334,11 @@ class TransformerAttnOnly(nn.Module):
         h: int,  # num heads
         layers: int,  # num layers
         context_length: int,  # context length
+        crate: bool = False,  # tied-style attention
     ):
         super().__init__()
+        # general
+        self.tied = crate
         # Embedding stage
         self.embedding: nn.Embedding = nn.Embedding(k, d)
         self.context_length = context_length
@@ -358,7 +363,7 @@ class TransformerAttnOnly(nn.Module):
     def forward(self, x):
         x = self._embed(x)
         for attn in self.transformer_blocks:
-            x = x + attn(x)
+            x = x + attn(x, tied=self.tied)
         x = self._unembed(x)
         return x
 
@@ -400,22 +405,21 @@ def test_qkov():
     model = TransformerAttnOnly(**model_info["params"])
     model.load_state_dict(model_info["state_dict"])
 
-    model.to('cuda')
+    model.to("cuda")
     qkov_ckt, direct = model.get_qk_ov_circuits()
-    model.to('cpu')
+    model.to("cpu")
     plt.imshow(direct.detach().cpu())
-    plt.title('direct path matrix')
+    plt.title("direct path matrix")
     plt.show()
     for qk_h, ov_h in qkov_ckt:
         for h, qk in enumerate(qk_h.unbind(0)):
             plt.imshow(qk.detach().cpu())
-            plt.title(f'qk circuit, head {h}')
+            plt.title(f"qk circuit, head {h}")
             plt.show()
         for h, ov in enumerate(ov_h.unbind(0)):
             plt.imshow(ov.detach().cpu())
-            plt.title(f'ov circuit, head {h}')
+            plt.title(f"ov circuit, head {h}")
             plt.show()
-
 
     print("a")
 
@@ -545,14 +549,15 @@ if __name__ == "__main__":
 
     context_length = 256
     load_model = False
-    save_path = "model_1layer_attnonly.pth"
+    save_path = "model_3layer_attnonly.pth"
     load_path = "model_6layer_attnonly.pth"
     model_params = {
         "k": num_vocab,
         "d": 384,
         "h": 6,
-        "layers": 1,
+        "layers": 3,
         "context_length": context_length,
+        "crate": False,
     }
     model = TransformerAttnOnly(**model_params)
     model.to(device)
@@ -653,4 +658,5 @@ if __name__ == "__main__":
             gen += tokenizer.decode([int(next_token)])
     print("The completion: " + gen)
 
+    # TODO: look at some small model scaling laws (calc compute FLOPS, chinchilla-style)
     time.sleep(1000)
