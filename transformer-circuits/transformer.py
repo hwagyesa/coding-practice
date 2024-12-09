@@ -405,9 +405,9 @@ def test_qkov():
     model = TransformerAttnOnly(**model_info["params"])
     model.load_state_dict(model_info["state_dict"])
 
-    model.to("cuda")
+    # model.to('cuda')
     qkov_ckt, direct = model.get_qk_ov_circuits()
-    model.to("cpu")
+    # model.to('cpu')
     plt.imshow(direct.detach().cpu())
     plt.title("direct path matrix")
     plt.show()

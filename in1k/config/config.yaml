@@ -1,0 +1,6 @@
+training:
+  device: 'cuda'
+  lr_initial: 0.01
+  weight_decay: 0
+  epochs: 256
+  batch_size: 1024
