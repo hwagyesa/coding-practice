@@ -548,14 +548,14 @@ if __name__ == "__main__":
         bigram_freqs = pickle.load(f)
 
     load_model = False
-    save_path = "model_1layer_attnonly.pth"
+    save_path = "model_2layer_attnonly.pth"
     load_path = "model_6layer_attnonly.pth"
     context_length = 256
     model_params = {
         "k": num_vocab,
         "d": 384,
         "h": 6,
-        "layers": 1,
+        "layers": 2,
         "context_length": context_length,
         "crate": False,
     }

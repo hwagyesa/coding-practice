@@ -38,6 +38,7 @@ import math
 import operator
 import random
 import os
+from collections import OrderedDict
 
 treescope.basic_interactive_setup(autovisualize_arrays=True)
 ```
@@ -251,14 +252,20 @@ class Transformer(nn.Module):
             torch.randn((context_length, d)), requires_grad=True
         )
         # Blocks: layers
-        transformer_blocks: list[tuple[MHSA, MLP]] = []
+        transformer_blocks: list[tuple[nn.Sequential, nn.Sequential]] = []
         for layer in range(layers):
             attn = MHSA(d=d, h=h, L=context_length)
             mlp = MLP(d=d)
-            transformer_blocks.append((attn, mlp))
+            ln_attn = nn.LayerNorm(d)
+            ln_mlp = nn.LayerNorm(d)
+            attn_block = nn.Sequential(OrderedDict([("norm", ln_attn), ("attn", attn)]))
+            mlp_block = nn.Sequential(OrderedDict([("norm", ln_mlp), ("mlp", mlp)]))
+            transformer_blocks.append((attn_block, mlp_block))
             # Register parameters for non-Sequential construction
             self.add_module(f"MHSA {layer}", attn)
             self.add_module(f"MLP {layer}", mlp)
+            self.add_module(f"MHSA LN {layer}", ln_attn)
+            self.add_module(f"MLP LN {layer}", ln_mlp)
         # self.transformer = nn.Sequential(*transformer_blocks)
         self.transformer_blocks = transformer_blocks
         # Output stage
@@ -270,7 +277,7 @@ class Transformer(nn.Module):
     def forward(self, x):
         x = self._embed(x)
         for attn, mlp in self.transformer_blocks:
-            x = x + attn(x, tied=self.tied)
+            x = x + attn(x) #, tied=self.tied)
             x = x + mlp(x)
         x = self._unembed(x)
         return x
@@ -290,8 +297,9 @@ class Transformer(nn.Module):
         E = self.embedding.weight.T  # d x k
         U = self.unembedding.weight  # k x d
         qkov_ckt = []
-        for attn, mlp in self.transformer_blocks:
-            qk, ov = attn.get_qk_ov()  # each is d x d
+        for attn_block, mlp_block in self.transformer_blocks:
+            # TODO: need to extract attn from the sequential
+            qk, ov = attn_block.attn.get_qk_ov()  # each is d x d
             qkov_ckt.append((E.T @ qk @ E, U @ ov @ E))
         direct = U @ E
         return qkov_ckt, direct
@@ -306,15 +314,15 @@ We'll include logic here for loading a model that we trained previously, if we w
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     load_model = True
-    save_path = "model_2layer.pth"
-    load_path = "model_2layer.pth"
+    save_path = "model_6layer.pth"
+    load_path = "model_6layer.pth"
 
     context_length = 256
     model_params = {
         "k": num_vocab,
         "d": 384,
         "h": 6,
-        "layers": 2,
+        "layers": 6,
         "context_length": context_length,
         "crate": False,
     }
@@ -322,7 +330,7 @@ We'll include logic here for loading a model that we trained previously, if we w
     model.to(device)
 
     # Hyperparameters
-    batches = 1024
+    batches = 4*1024
     batch_size = 64
     lr = 1e-3
     wd = 1e-1
@@ -372,7 +380,7 @@ We'll include logic here for loading a model that we trained previously, if we w
         }
         torch.save(model_info, save_path)
 
-        plt.plot(losses)
+        plt.plot(torch.tensor(losses).to("cpu"))
         plt.title("Batch loss values (CE)")
         plt.show()
     else:
@@ -510,9 +518,9 @@ Let's try:
 This can be complicated, let's see a basic example first.
 
 ```{python}
-prompt = "Tim and Sam went to the store. Sam said hello to "
+prompt = "Tim and Sam played catch. Sam threw the ball to "
 prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32).to(device)
-num_toks = 5
+num_toks = 3
 temperature = 0.5
 with torch.no_grad():
     gen = ""
@@ -531,12 +539,3 @@ Some takeaways:
   much "general knowledge" to memorize in a shallow model.
 - If we want to train a deeper model, we might need to add layernorm, and we would need
   to run on GPU (CPU too slow).
-
-
-
-
-
-
-
-
-
