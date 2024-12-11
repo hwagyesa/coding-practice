@@ -547,15 +547,15 @@ if __name__ == "__main__":
     with open("bigrams.pkl", "rb") as f:
         bigram_freqs = pickle.load(f)
 
-    context_length = 256
     load_model = False
-    save_path = "model_3layer_attnonly.pth"
+    save_path = "model_1layer_attnonly.pth"
     load_path = "model_6layer_attnonly.pth"
+    context_length = 256
     model_params = {
         "k": num_vocab,
         "d": 384,
         "h": 6,
-        "layers": 3,
+        "layers": 1,
         "context_length": context_length,
         "crate": False,
     }
@@ -595,11 +595,14 @@ if __name__ == "__main__":
 
             logits = model(x_batch.to(torch.int32))
             loss = ce_loss(logits.transpose(-2, -1), y_batch.to(torch.int64))
-            # CE loss is reduced with 'mean' by default + this takes a mean over the sequence dim too
-            # So these loss values are 'optimally' of size about log(batch_size) / context_length
+            # CE loss is reduced with 'mean' by default + this takes a mean
+            # over the sequence dim too
+            # So these loss values are 'optimally' of size about
+            # log(batch_size) / context_length
 
             loss.backward()
-            # TODO: unstable training even with grad clipping sometimes at 6layer model. Find out why
+            # TODO: unstable training even with grad clipping sometimes at
+            # 6layer model. Find out why
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()

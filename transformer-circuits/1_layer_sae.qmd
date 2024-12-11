@@ -1,0 +1,542 @@
+---
+title: Train a SAE on a shallow transformer
+format:
+    html:
+        code-fold: show
+---
+
+# Description
+
+We're going to try training a sparse autoencoder on a shallow transformer. Shallow transformers
+can't learn very useful representations of language, but this will give us an easy testbed
+in which we can try training a SAE.
+
+This will be our scaffolding:
+
+- We'll use code that we wrote previously for training shallow transformers. This code is written
+  from scratch, with some referencing against [NanoGPT](https://github.com/karpathy/nanoGPT) for things like
+  the training loop and sampling.
+- For SAEs, we'll use as a reference the paper by [Cunningham et al.](https://arxiv.org/abs/2309.08600), but
+  implement everything ourselves.
+
+## Code imports
+
+We'll import general things here.
+
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+import treescope
+import torch
+import torch.nn.functional as F
+from torch import nn
+from tqdm import tqdm
+from pathlib import Path
+import pickle
+import dataclasses
+import math
+import operator
+import random
+import os
+
+treescope.basic_interactive_setup(autovisualize_arrays=True)
+```
+
+# Model training
+
+We'll put code here for training the simple one-layer transformer.
+It would be easiest to import things from our base python file, but
+to have this notebook be self-contained (and exportable to Colab for testing later),
+we'll put all code here.
+
+Basic model/training specs:
+
+- Trained on [tinystories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset.
+- Bespoke ASCII tokenizer with one special token (endoftext marker for Tinystories dataset)
+- Transformer architecture. Shallow with no layernorm and no positional embedding.
+
+## Imports
+
+```{python}
+import unicodedata
+import re
+import wget
+```
+
+## Preprocess data (tokenizer, etc.)
+
+TinyStories is large enough (2GB) to be an annoyance to process in one shot on a CPU. So we'll preprocess
+it here and write the results to a pickle file. If we already did this, we'll just load it.
+
+```{python}
+@dataclasses.dataclass
+class ASCIITokenizerSpecial:
+    """Simple ASCII tokenizer, vocab size 129 (1 special token)"""
+
+    def encode(self, text: str) -> list[int]:
+        assert text.isascii(), "Input string characters need to be valid ASCII"
+        # Process special character "<|endoftext|>"
+        pat = re.compile("(" + re.escape("<|endoftext|>") + ")")
+        special_split = re.split(pat, text)
+        tokens = []
+        for string in special_split:
+            if string == "<|endoftext|>":
+                tokens += [128]
+            else:
+                tokens += [ord(c) for c in string]
+        return tokens
+
+    def decode(self, tokens: list[int]) -> str:
+        assert all(
+            0 <= i <= 128 for i in tokens
+        ), "Input tokens need to correspond to valid ASCII + 1 special"
+        # Scan for special tokens. Lazily convert them to Unicode replacement char
+        codepoint = 65533
+        for i, tok in enumerate(tokens):
+            if tok == 128:
+                tokens[i] = codepoint
+        return "".join(chr(i) for i in tokens)
+
+
+def normalize_quotes(text):
+    """Scrub unicode quotes from tinystories"""
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+
+
+def prepare_tinystories_block(
+    path: Path = Path("./data"), max_context_length: int = 1024
+):
+    """Get a training set of documents; concatenate into a big corpus that we'll subsample"""
+    train_path = path / Path("TinyStoriesV2-GPT4-train.txt")
+    val_path = path / Path("TinyStoriesV2-GPT4-valid.txt")
+
+    if not os.path.exists(train_path):
+        # Download the data
+        print("Downloading tinystories train and val.")
+        train_url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt"
+        val_url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt"
+        wget.download(train_url, train_path)
+        wget.download(val_url, val_path)
+
+    tokenizer = ASCIITokenizerSpecial()
+    print("Reading train data.")
+    with open(train_path, "r+") as f:
+        text = normalize_quotes(f.read())
+
+    print("Encoding train data.")
+    return tokenizer.encode(text)
+```
+
+```{python}
+    num_vocab_base = 128
+    num_vocab_special = 1  # pad token
+    num_vocab = num_vocab_base + num_vocab_special
+
+    if not os.path.exists("tokens.pkl"):
+        # Download data if necessary, and process it
+        print("Processing text datasets into tokens.")
+        tokens_list = prepare_tinystories_block(max_context_length=num_vocab)
+        print("Converting tokenized data to tensor.")
+        tokens = torch.tensor(tokens_list, dtype=torch.uint8)
+        print("Writing tokenized/tensorized data to file for future use.")
+        with open("tokens.pkl", "wb") as f:
+            pickle.dump(tokens, f)
+    else:
+        print("Loading dataset of tokens.")
+        with open("tokens.pkl", "rb") as f:
+            tokens = pickle.load(f)
+        print("Data loaded.")
+```
+
+## Model definition
+
+We define our simple transformer architecture here.
+
+### Blocks
+
+```{python}
+class MHSA(nn.Module):
+    """Multi-Head Self Attention (causal). No caching."""
+
+    def __init__(self, d: int, h: int, L: int):
+        super().__init__()
+        self.d = d
+        self.h = h
+        self.L = L
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        nn.init.kaiming_normal_(self.qkv.weight, nonlinearity="linear")
+        self.projection = nn.Linear(d, d, bias=False)
+        nn.init.kaiming_normal_(self.projection.weight, nonlinearity="linear")
+
+    def forward(self, x, tied=False):
+        return self._forward_einsum(x, tied=tied)
+
+    def _forward_einsum(self, x, tied=False):
+        device = x.device
+        # x is: b x L x d
+        q, k, v = self.qkv(x).split(self.d, dim=-1)  # b x L x 3d
+        if tied:
+            q, k, v = q, q, q
+        Q = q.view(q.shape[:-1] + (self.h, self.d // self.h))
+        K = k.view(k.shape[:-1] + (self.h, self.d // self.h))
+        V = v.view(v.shape[:-1] + (self.h, self.d // self.h))  # b x L x h x (d/h)
+        scores = torch.einsum("blhd,bmhd->bhlm", Q, K) / math.sqrt(self.d / self.h)
+        L = x.shape[-2]
+        mask = (
+            torch.arange(L, device=device)[:, None]
+            < torch.arange(L, device=device)[None, :]
+        )
+        scores += torch.where(mask, -torch.inf, 0)  # to zero out, put -inf!
+        attention = nn.functional.softmax(scores, dim=-1)
+        # attention = nn.functional.softmax(scores, dim=-1)
+        self_attention = torch.einsum("bhml,blhd->bmhd", attention, V)
+        concatenated = torch.cat(self_attention.unbind(dim=-2), -1)
+        out = self.projection(concatenated)
+        return out
+
+    def get_qk_ov(self):
+        qkv_weight = self.qkv.weight  # 3d x d
+        qkv_weight_split = qkv_weight.view(
+            3, self.h, self.d // self.h, self.d
+        )  # 3 x h x d/h x d
+        q_proj, k_proj, v_proj = qkv_weight_split.unbind(0)  # each is h x d/h x d
+        qk_proj = q_proj.transpose(-1, -2) @ k_proj  # h x d x d
+        proj_weight = self.projection.weight  # d x d
+        # Extract column submatrices
+        proj_weight_split = proj_weight.T.view(
+            self.h, self.d // self.h, self.d
+        )  # h x d/h x d
+        ov_proj = proj_weight_split.transpose(-1, -2) @ v_proj  # h x d x d
+        return qk_proj, ov_proj
+
+
+class MLP(nn.Module):
+    def __init__(self, d: int):
+        super().__init__()
+        self.d = d
+        self.hidden = nn.Linear(self.d, 4 * self.d, bias=False)
+        self.nonlinearity = nn.GELU(approximate="tanh")
+        self.projection = nn.Linear(4 * self.d, self.d, bias=False)
+        nn.init.kaiming_normal_(self.hidden.weight, nonlinearity="relu")
+        nn.init.kaiming_normal_(self.projection.weight, nonlinearity="relu")
+
+    def forward(self, x):
+        activations = self.nonlinearity(self.hidden(x))
+        out = self.projection(activations)
+        return out
+```
+
+### Transformer
+
+```{python}
+class Transformer(nn.Module):
+    """Transformer architecture. No Epos, No layernorm!"""
+
+    def __init__(
+        self,
+        k: int,  # vocab size
+        d: int,  # embedding dim
+        h: int,  # num heads
+        layers: int,  # num layers
+        context_length: int,  # context length
+        crate: bool = False,  # tied-style attention
+    ):
+        super().__init__()
+        # general
+        self.tied = crate
+        # Embedding stage
+        self.embedding: nn.Embedding = nn.Embedding(k, d)
+        self.context_length = context_length
+        self.embedding_pos = nn.Parameter(
+            torch.randn((context_length, d)), requires_grad=True
+        )
+        # Blocks: layers
+        transformer_blocks: list[tuple[MHSA, MLP]] = []
+        for layer in range(layers):
+            attn = MHSA(d=d, h=h, L=context_length)
+            mlp = MLP(d=d)
+            transformer_blocks.append((attn, mlp))
+            # Register parameters for non-Sequential construction
+            self.add_module(f"MHSA {layer}", attn)
+            self.add_module(f"MLP {layer}", mlp)
+        # self.transformer = nn.Sequential(*transformer_blocks)
+        self.transformer_blocks = transformer_blocks
+        # Output stage
+        # self.output_layernorm = nn.LayerNorm(d)
+        # self.unembedding = nn.Parameter(torch.randn(d, k))
+        self.unembedding = nn.Linear(d, k, bias=False)
+        nn.init.kaiming_normal_(self.unembedding.weight, nonlinearity="linear")
+
+    def forward(self, x):
+        x = self._embed(x)
+        for attn, mlp in self.transformer_blocks:
+            x = x + attn(x, tied=self.tied)
+            x = x + mlp(x)
+        x = self._unembed(x)
+        return x
+
+    def _embed(self, x):
+        # return self.embedding(x) + self.embedding_pos[None, : x.shape[1], :]
+        return self.embedding(x)
+
+    def _unembed(self, x):
+        # x = self.output_layernorm(x)
+        # logits = x @ self.embedding.weight.T  # b x L x k
+        # logits = x @ self.unembedding  # b x L x k
+        logits = self.unembedding(x)
+        return logits
+
+    def get_qk_ov_circuits(self):
+        E = self.embedding.weight.T  # d x k
+        U = self.unembedding.weight  # k x d
+        qkov_ckt = []
+        for attn, mlp in self.transformer_blocks:
+            qk, ov = attn.get_qk_ov()  # each is d x d
+            qkov_ckt.append((E.T @ qk @ E, U @ ov @ E))
+        direct = U @ E
+        return qkov_ckt, direct
+```
+
+
+## Training loop
+
+We'll include logic here for loading a model that we trained previously, if we want to.
+
+```{python}
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    load_model = True
+    save_path = "model_2layer.pth"
+    load_path = "model_2layer.pth"
+
+    context_length = 256
+    model_params = {
+        "k": num_vocab,
+        "d": 384,
+        "h": 6,
+        "layers": 2,
+        "context_length": context_length,
+        "crate": False,
+    }
+    model = Transformer(**model_params)
+    model.to(device)
+
+    # Hyperparameters
+    batches = 1024
+    batch_size = 64
+    lr = 1e-3
+    wd = 1e-1
+
+    # Prepare data
+    num_tokens = tokens.shape[0]
+
+    # Prepare optimizer
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=lr, weight_decay=wd)
+    ce_loss = torch.nn.CrossEntropyLoss()
+
+    losses = []
+
+    if not load_model:
+        # Train
+        model.train()
+        pbar = tqdm(range(batches))
+        for batch in pbar:
+            # Get a batch of data, sampling with replacement
+            idxs = torch.randint(num_tokens - context_length, (batch_size,))
+            x_batch = torch.stack([tokens[i : i + context_length] for i in idxs])
+            y_batch = torch.stack([tokens[i + 1 : i + 1 + context_length] for i in idxs])
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+
+            logits = model(x_batch.to(torch.int32))
+            loss = ce_loss(logits.transpose(-2, -1), y_batch.to(torch.int64))
+            # CE loss is reduced with 'mean' by default + this takes a mean
+            # over the sequence dim too
+            # So these loss values are 'optimally' of size about
+            # log(batch_size) / context_length
+
+            loss.backward()
+            # TODO: unstable training even with grad clipping sometimes at
+            # 6layer model. Find out why
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Logging
+            loss_val = loss.detach()
+            losses.append(loss_val)
+            pbar.set_postfix({"batch loss": f"{loss_val:.3f}"})
+        # Save model
+        model_info = {
+            "state_dict": model.to("cpu").state_dict(),
+            "params": model_params,
+        }
+        torch.save(model_info, save_path)
+
+        plt.plot(losses)
+        plt.title("Batch loss values (CE)")
+        plt.show()
+    else:
+        # Load from file
+        model_info = torch.load(load_path)
+        model = Transformer(**model_info["params"])
+        model.load_state_dict(model_info["state_dict"])
+```
+
+## Eval the trained model
+
+Perform a very basic eval: sample a document from the TinyStories val set, and provide a completion.
+
+```{python}
+def prepare_tinystories(path: Path = Path("./data"), max_context_length: int = 1024):
+    """Get a training set of documents. Filter by our context length."""
+    train_path = path / Path("TinyStoriesV2-GPT4-train.txt")
+    val_path = path / Path("TinyStoriesV2-GPT4-valid.txt")
+    # Split pattern
+    pat = re.compile(re.escape("<|endoftext|>"))
+
+    with open(val_path, "r+") as f:
+        text = f.read()
+        documents = re.split(pat, text)
+    valid_documents = [
+        normalize_quotes(doc) for doc in documents if len(doc) <= max_context_length
+    ]
+    tokens_list, first_pad_idx = tokenize_and_pad(valid_documents)
+    return valid_documents, tokens_list, first_pad_idx
+
+
+def tokenize_and_pad(texts: list[str]) -> tuple[list[list[int]], list[int]]:
+    """Input batch of document, output tokenized documents (w/ padding)"""
+    pad_token = 128
+    tokenizer = ASCIITokenizerSpecial()
+    tokens_list = [tokenizer.encode(text) for text in texts]
+    first_pad_token_idx = list(map(len, tokens_list))
+    L = max(first_pad_token_idx)
+    padded_tokens_list = [
+        tokens + [pad_token] * (L - i)
+        for (tokens, i) in zip(tokens_list, first_pad_token_idx)
+    ]
+    return padded_tokens_list, first_pad_token_idx
+
+
+def sample(temperature: float, logits: torch.Tensor):
+    if temperature > 0:
+        probs = nn.functional.softmax(logits / temperature, dim=0)
+        next_token = torch.multinomial(probs, num_samples=1)
+    else:
+        next_token = logits.argmax(keepdim=True)
+    return next_token
+```
+
+```{python}
+    # Sample
+    model.to(device)
+    model.eval()
+    # Get some prompts
+    docs, _, __ = prepare_tinystories(max_context_length=512)
+    i = random.randint(0, len(docs) - 1)
+    prompt = docs[i][: context_length // 2]
+    print("The prompt: " + prompt)
+    # inference: temperature-based
+    temperature = 0.5
+    # TODO: KV-raching
+    # TODO: batch inference
+    # TODO: More fun sampling strategies
+    num_toks = context_length // 2
+    tokenizer = ASCIITokenizerSpecial()
+    prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32).to(device)
+    with torch.no_grad():
+        gen = ""
+        for gens in tqdm(range(num_toks)):
+            logits = model(prompt_tokens.unsqueeze(0))[0, -1, ...]
+            next_token = sample(temperature, logits)
+            prompt_tokens = torch.cat((prompt_tokens, next_token))
+            gen += tokenizer.decode([int(next_token)])
+    print("The completion: " + gen)
+```
+
+
+# Interpretation with SAEs
+
+What type of experiment would we like to define here? Some thoughts:
+
+- Cunningham et al. consider assessing whether SAEs lead to more interpretable features than
+  other baseline methods, using "autointerpretability scores".
+  They also use activation patching with learned SAE features to assess the extent to which SAE features
+  can localize task-specific behavior on the IOI task
+  [(ref)](https://arxiv.org/abs/2211.00593). In these experiments, features are selected for
+  intervention based on the automated circuit discovery algorithm
+  [(ref)](https://arxiv.org/abs/2304.14997). They also perform case studies on whether dictionary features
+  are human-interpretable in certain contexts.
+  - The SAE model is weight-tied, one layer with ReLU nonlinearity on the encoder (to promote sparsity), and trained
+    with a weighted reconstruction loss (weights on the $\ell^1$ norm of the sparse codes).
+    This can be seen as a single-iteration ISTA encoder with nonnegativity constraint!
+  - We can see a range of experimental designs here: some designed to be 'automated' analyses
+    runnable at scale (with coarser conclusions), and others (case studies) done at small scales but which might
+    have more 'impressive' results (which may of course not generalize).
+  - The authors train SAEs at different locations, but many are done on residual stream neurons.
+- [Bricken et al.](https://transformer-circuits.pub/2023/monosemantic-features)
+  focus on a 1-layer model and train SAEs on MLP neurons (hidden layer
+  activations). There are some guidelines given for SAE training: they consider
+  a similar objective and architecture, but introduce more biases, untied
+  weights, and resampling tricks for dead SAE neurons. [Templeton et
+  al.](https://transformer-circuits.pub/2024/scaling-monosemanticity/)
+  elaborate further over this methodology, without changing the essential
+  architecture: experiments are on residual stream neurons rather than MLP
+  neurons, though (one mentioned reason is due to dimensionality
+  considerations).
+- [Gao et al.](https://arxiv.org/abs/2406.04093v1) propose to train top-$k$
+  sparse autoencoders, where only the top-$k$ magnitude activating projections
+  are kept to form the sparse code. This can again be seen as LISTA-type
+  network, but with a SLOPE-type penalty that uses hard thresholding instead of
+  soft thresholding. In this work, the authors train SAEs on residual stream
+  neurons.
+  There are also techniques for reducing dead latents: initialize the encoder weights to be
+  the adjoint of the decoder weights (then train untied), and an additional regularizer
+  that promotes the SAE residual to be close to the "top-$k$ dead latents" residual.
+  See also [Eleuther AI's code](https://github.com/EleutherAI/sae).
+
+
+## A toy experiment: IOI
+
+How well can our toy transformer do on a synthetic indirect object identification (IOI) task?
+It's not clear that we have a diverse enough training set for this:
+we've only trained on $1024 * 256 * 64 = 16\mathrm{M}$ tokens, and TinyStories is not an
+extremely diverse dataset.
+Let's try:
+
+1. Filter a list of names from TinyObjects to use as synthetic data.
+2. Filter 'auxiliary' words that occur frequently, like verbs and direct objects ("A Xed the Y to B")
+
+This can be complicated, let's see a basic example first.
+
+```{python}
+prompt = "Tim and Sam went to the store. Sam said hello to "
+prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32).to(device)
+num_toks = 5
+temperature = 0.5
+with torch.no_grad():
+    gen = ""
+    for gens in tqdm(range(num_toks)):
+        logits = model(prompt_tokens.unsqueeze(0))[0, -1, ...]
+        next_token = sample(temperature, logits)
+        prompt_tokens = torch.cat((prompt_tokens, next_token))
+        gen += tokenizer.decode([int(next_token)])
+print("The completion: " + gen)
+```
+
+Some takeaways:
+
+- Model is too shallow. This is probably also a consequence of us using ASCII
+  tokenizer rather than a more general BPE tokenizer, and this dataset not containing
+  much "general knowledge" to memorize in a shallow model.
+- If we want to train a deeper model, we might need to add layernorm, and we would need
+  to run on GPU (CPU too slow).
+
+
+
+
+
+
+
+
+
